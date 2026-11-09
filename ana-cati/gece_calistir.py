@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# gece_calistir.py
+# Gece vardiyasi: gorevler/kuyruk/ icindeki gorevleri ilgili departman klasorunde
+# Gemini CLI ile (headless) calistirir, raporlari yazar ve sabah mail ile ozet gonderir.
+#
+# Kullanim:
+#   python gece_calistir.py                       # kuyrugu calistir + mail at
+#   python gece_calistir.py --kuru                # yalnizca neyin calisacagini goster
+#   python gece_calistir.py --mail-yok            # mail atma
+#   python gece_calistir.py --mail-test           # yalnizca test maili gonder
+#   python gece_calistir.py --zamanlayici-komutu  # Windows Gorev Zamanlayici komutunu yazdir
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import smtplib
+import subprocess
+import sys
+import time
+from email.message import EmailMessage
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+ROOT = Path(__file__).resolve().parent  # ana-cati
+DESK = ROOT.parent
+# KOPYA_V1: departmanlar masaustundeki ana-* klasorlerinden otomatik bulunur (ana-cati haric)
+DEPTS = {p.name[4:]: p.name for p in sorted(DESK.glob("ana-*")) if p.is_dir() and p.name != "ana-cati"}
+KUYRUK = ROOT / "gorevler" / "kuyruk"
+BITEN = ROOT / "gorevler" / "tamamlandi"
+HATALI = ROOT / "gorevler" / "hatali"
+RAPORLAR = ROOT / "raporlar"
+MODLAR = {"auto_edit", "yolo", "plan"}
+MAIL_ENV = Path.home() / ".ana-cati" / "mail.env"
+
+KURALLAR = "\n".join([
+    "GECE VARDIYASI KURALLARI (otomatik calistirma; kullanici cevap veremez):",
+    "- Soru sorma, onay bekleme. Belirsizlikte en makul varsayimi yap ve raporuna yaz.",
+    "- Yalnizca bu klasorde (mevcut calisma dizini) dosya olustur veya duzenle.",
+    "- Dosya silme. Disariya yayin yapma: git push, post, makale yayini, deploy, e-posta yok.",
+    "- Gizli bilgi (anahtar, sifre) okuma veya yazma.",
+    "- Ciktilari cikti/<gorev-id>/ altina koy (kod projesiyse proje klasoru altina; yolunu raporla).",
+    "- Takilirsan dur; yaptigini ve takildigin yeri raporla. Sonsuz deneme yapma.",
+    "- Son mesajin tam olarak su basliklarla bitsin:",
+    "  DURUM: TAMAM | KISMI | BASARISIZ",
+    "  YAPILAN: (madde madde)",
+    "  DOSYALAR: (olusan/degisen yollar)",
+    "  ACIK_SORULAR: (Eda'ya sorular)",
+    "  ONAY_BEKLEYEN: (yayin/push gibi onay isteyen adimlar)",
+])
+
+
+def log(msg):
+    line = f"[{dt.datetime.now():%H:%M:%S}] {msg}"
+    print(line)
+    try:
+        RAPORLAR.mkdir(parents=True, exist_ok=True)
+        with open(RAPORLAR / "gece.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def parse(path):
+    txt = path.read_text(encoding="utf-8")
+    meta, body = {}, txt
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", txt, re.S)
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                meta[k.strip().lower()] = v.split("#", 1)[0].strip()
+        body = m.group(2)
+    return meta, body.strip()
+
+
+def find_report(task_id):
+    hits = sorted(RAPORLAR.glob(f"*/{task_id}.md"))
+    return hits[-1] if hits else None
+
+
+YASAK_DIZIN = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+YASAK_UZANTI = {".pem", ".key", ".pfx", ".p12"}
+MAX_DOSYA = 300
+MAX_BOYUT = 1_000_000
+
+
+def kopya_al(spec, dept_dir):
+    # Baska departman klasorlerinden salt okunur ANLIK KOPYA alir (ana-kalite icin).
+    notlar = []
+    kok = DESK.resolve()
+    for ref in [x.strip() for x in spec.split(",") if x.strip()]:
+        try:
+            src = (DESK / ref).resolve()
+            rel = src.relative_to(kok)
+        except Exception:
+            notlar.append(f"UYARI: '{ref}' gecersiz yol; kopyalanmadi.")
+            continue
+        if not src.exists() or not rel.parts or rel.parts[0] not in DEPTS.values():
+            notlar.append(f"UYARI: '{ref}' bulunamadi veya bir departman klasoru altinda degil.")
+            continue
+        hedef = dept_dir / "girdi" / "kopya" / "__".join(rel.parts)
+        if hedef.exists():
+            shutil.rmtree(hedef)
+        hedef.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            adaylar = []
+            for kok_d, dizinler, dosyalar in os.walk(src):
+                dizinler[:] = [d for d in dizinler if d not in YASAK_DIZIN]
+                adaylar += [Path(kok_d) / f for f in dosyalar]
+        else:
+            adaylar = [src]
+        sayac = 0
+        for f in adaylar:
+            ad = f.name.lower()
+            if f.is_symlink() or f.suffix.lower() in YASAK_UZANTI:
+                continue
+            if ad.startswith(".env") and not ad.endswith(".example"):
+                continue
+            try:
+                if f.stat().st_size > MAX_BOYUT:
+                    continue
+            except OSError:
+                continue
+            if sayac >= MAX_DOSYA:
+                notlar.append(f"UYARI: '{ref}' icin {MAX_DOSYA} dosya siniri doldu.")
+                break
+            cikis = hedef / (f.relative_to(src) if src.is_dir() else Path(f.name))
+            cikis.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(f, cikis)
+            sayac += 1
+        notlar.append(f"Kopya: girdi/kopya/{hedef.name} ({sayac} dosya)")
+    return notlar
+
+
+def build_prompt(tid, ajan, dept_dir, meta, body):
+    parts = [KURALLAR, "", f"GOREV ID: {tid}", f"DEPARTMAN: {ajan}", ""]
+    for gid in [x.strip() for x in meta.get("girdi", "").split(",") if x.strip()]:
+        src = find_report(gid)
+        if src:
+            dest = dept_dir / "girdi" / f"{gid}.md"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dest)
+            parts.append(f"Girdi dosyasi: girdi/{gid}.md (onceki gorevin raporu; oku ve kullan)")
+        else:
+            parts.append(f"UYARI: '{gid}' gorevinin raporu bulunamadi; bunu raporunda belirt.")
+    if meta.get("kopya"):
+        parts.append("Denetlenecek dosyalar ORIJINALLERIN ANLIK KOPYASIDIR (salt okunur referans; degistirme):")
+        parts += [f"- {n}" for n in kopya_al(meta["kopya"], dept_dir)]
+    parts += ["", "GOREV:", body]
+    return "\n".join(parts)
+
+
+def yanit_cikar(stdout):
+    for aday in (stdout, stdout[stdout.find("{"): stdout.rfind("}") + 1] if "{" in stdout else ""):
+        try:
+            data = json.loads(aday)
+            return data.get("response") or stdout
+        except Exception:
+            continue
+    return stdout
+
+
+def bolum(metin, ad):
+    m = re.search(rf"{ad}:\s*(.*?)(?=\n[A-Z_]{{4,}}:|\Z)", metin, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def calistir(path, gemini, bitis):
+    tid = path.stem
+    meta, body = parse(path)
+    ajan = meta.get("ajan", "").lower()
+    sonuc = {"id": tid, "ajan": ajan, "mod": "-", "durum": "HATA", "saniye": 0, "metin": "", "karar": ""}
+    if ajan not in DEPTS:
+        sonuc["metin"] = f"Gecersiz 'ajan' degeri: '{ajan}'. Gecerli: {', '.join(DEPTS)}"
+        return sonuc
+    dept_dir = DESK / DEPTS[ajan]
+    if not dept_dir.is_dir():
+        sonuc["metin"] = f"Departman klasoru yok: {dept_dir}"
+        return sonuc
+    mod = meta.get("mod", "auto_edit").lower()
+    mod = mod if mod in MODLAR else "auto_edit"
+    try:
+        sure = float(meta.get("sure_dk", "30") or 30)
+    except ValueError:
+        sure = 30.0
+    kalan = (bitis - time.time()) / 60
+    sure = max(0.1, min(sure, kalan))
+    sonuc["mod"] = mod
+    prompt = build_prompt(tid, ajan, dept_dir, meta, body)
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MAIL_")}
+    cmd = [gemini, "-p", "Gorevi stdin'den oku ve uygula.", "--approval-mode", mod,
+           "--output-format", "json"]
+    log(f"BASLADI {tid} ({ajan}, mod={mod}, en fazla {sure:g} dk)")
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, input=prompt, cwd=dept_dir, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=sure * 60, env=env)
+        metin = yanit_cikar(p.stdout or "")
+        if p.returncode != 0:
+            sonuc["durum"] = "HATA"
+            metin = f"Cikis kodu {p.returncode}\n{(p.stderr or '')[-1500:]}\n{metin}"
+        else:
+            m = re.search(r"DURUM:\s*(TAMAM|KISMI|BASARISIZ)", metin)
+            sonuc["durum"] = m.group(1) if m else "BILINMIYOR"
+            km = re.search(r"KARAR:\s*(GECTI|KOSULLU|KALDI)", metin)
+            sonuc["karar"] = km.group(1) if km else ""
+        sonuc["metin"] = metin
+    except subprocess.TimeoutExpired:
+        sonuc["durum"] = "ZAMAN_ASIMI"
+        sonuc["metin"] = f"{sure:g} dakika icinde bitmedi; yarim kalan dosyalar {DEPTS[ajan]} icinde olabilir."
+    sonuc["saniye"] = int(time.time() - t0)
+    log(f"BITTI   {tid}: {sonuc['durum']} ({sonuc['saniye']} sn)")
+    return sonuc
+
+
+def rapor_yaz(gun_dir, s):
+    gun_dir.mkdir(parents=True, exist_ok=True)
+    yol = gun_dir / f"{s['id']}.md"
+    yol.write_text(
+        f"# {s['id']}\n\n- Ajan: {s['ajan']}\n- Mod: {s['mod']}\n- Durum: {s['durum']}\n"
+        f"- Sure: {s['saniye']} sn\n\n---\n\n{s['metin']}\n", encoding="utf-8")
+    return yol
+
+
+def ozet_olustur(sonuclar, gun):
+    tamam = sum(1 for s in sonuclar if s["durum"] in ("TAMAM", "KISMI", "BILINMIYOR"))
+    hata = len(sonuclar) - tamam
+    satirlar = [f"Gece raporu {gun}: {tamam} tamam, {hata} sorunlu", ""]
+    for s in sonuclar:
+        karar = f", KARAR: {s['karar']}" if s.get("karar") else ""
+        satirlar.append(f"- {s['id']} [{s['ajan']}] -> {s['durum']}{karar} ({s['saniye']} sn)")
+    bekle = []
+    for s in sonuclar:
+        for ad, baslik in (("ACIK_SORULAR", "Sorular"), ("ONAY_BEKLEYEN", "Onay bekleyen")):
+            icerik = bolum(s["metin"], ad)
+            if icerik and icerik.strip("-* \n").lower() not in ("yok", "none", "-"):
+                bekle.append(f"[{s['id']}] {baslik}:\n{icerik}")
+    if bekle:
+        satirlar += ["", "SENDEN BEKLENENLER", ""] + bekle
+    satirlar += ["", "DETAYLAR", ""]
+    for s in sonuclar:
+        satirlar += [f"## {s['id']}", s["metin"][:1200], ""]
+    satirlar.append(f"Tam raporlar: {RAPORLAR / gun}")
+    return "\n".join(satirlar), tamam, hata
+
+
+def env_oku(path):
+    cfg = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    return cfg
+
+
+def mail_gonder(konu, govde):
+    cfg = env_oku(MAIL_ENV)
+    user, pw = cfg.get("MAIL_USER"), cfg.get("MAIL_PASSWORD")
+    if not user or not pw:
+        log(f"Mail ayari yok/eksik: {MAIL_ENV} (rapor yine de dosyaya yazildi)")
+        return False
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = user, cfg.get("MAIL_TO", user), konu
+    msg.set_content(govde)
+    try:
+        with smtplib.SMTP_SSL(cfg.get("MAIL_HOST", "smtp.gmail.com"),
+                              int(cfg.get("MAIL_PORT", "465")), timeout=60) as s:
+            s.login(user, pw)
+            s.send_message(msg)
+        log("Mail gonderildi.")
+        return True
+    except Exception as e:
+        log(f"Mail gonderilemedi: {e}")
+        return False
+
+
+def zamanlayici_komutu():
+    py = sys.executable
+    script = ROOT / "gece_calistir.py"
+    print("PowerShell'e yapistirin (her gece 02:00):\n")
+    print(f'$a = New-ScheduledTaskAction -Execute "{py}" -Argument \'"{script}"\' -WorkingDirectory "{ROOT}"')
+    print("$t = New-ScheduledTaskTrigger -Daily -At 2:00AM")
+    print("$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun -ExecutionTimeLimit (New-TimeSpan -Hours 8)")
+    print('Register-ScheduledTask -TaskName "AnaCati-Gece" -Action $a -Trigger $t -Settings $s -Force')
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ana-cati gece vardiyasi")
+    ap.add_argument("--kuru", action="store_true", help="Calistirmadan listele")
+    ap.add_argument("--mail-yok", action="store_true", help="Mail gonderme")
+    ap.add_argument("--mail-test", action="store_true", help="Yalnizca test maili gonder")
+    ap.add_argument("--zamanlayici-komutu", action="store_true")
+    ap.add_argument("--limit", type=int, default=8, help="En fazla gorev sayisi")
+    ap.add_argument("--max-saat", type=float, default=6.0, help="Toplam sure siniri")
+    args = ap.parse_args()
+
+    if args.zamanlayici_komutu:
+        zamanlayici_komutu()
+        return 0
+    if args.mail_test:
+        return 0 if mail_gonder("[ana-cati] Test maili", "Mail ayari calisiyor.") else 1
+
+    gorevler = sorted(p for p in KUYRUK.glob("*.md"))[: args.limit]
+    if not gorevler:
+        log("Kuyruk bos; yapilacak is yok.")
+        return 0
+    if args.kuru:
+        for p in gorevler:
+            meta, _ = parse(p)
+            print(f"{p.name}: ajan={meta.get('ajan')} mod={meta.get('mod', 'auto_edit')}")
+        return 0
+
+    gemini = shutil.which("gemini")
+    if not gemini:
+        log("HATA: 'gemini' komutu PATH'te bulunamadi.")
+        return 1
+
+    for d in (BITEN, HATALI):
+        d.mkdir(parents=True, exist_ok=True)
+    gun = dt.date.today().isoformat()
+    bitis = time.time() + args.max_saat * 3600
+    sonuclar = []
+    for p in gorevler:
+        if time.time() >= bitis:
+            log(f"Sure siniri doldu; {p.name} ve sonrasi calistirilmadi (kuyrukta kaldi).")
+            break
+        s = calistir(p, gemini, bitis)
+        rapor_yaz(RAPORLAR / gun, s)
+        hedef = BITEN if s["durum"] in ("TAMAM", "KISMI", "BILINMIYOR") else HATALI
+        shutil.move(str(p), str(hedef / f"{gun}-{p.name}"))
+        sonuclar.append(s)
+
+    if not sonuclar:
+        return 0
+    govde, tamam, hata = ozet_olustur(sonuclar, gun)
+    (RAPORLAR / gun).mkdir(parents=True, exist_ok=True)
+    (RAPORLAR / gun / "OZET.md").write_text(govde, encoding="utf-8")
+    if not args.mail_yok:
+        mail_gonder(f"[ana-cati] Gece raporu {gun}: {tamam} tamam, {hata} sorunlu", govde)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
